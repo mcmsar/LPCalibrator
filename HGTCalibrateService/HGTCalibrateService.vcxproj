@@ -1,0 +1,155 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{3B46FA07-38A5-4EB8-95C2-314DE698E9CF}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>HGTCalibrateService</RootNamespace>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <LinkIncremental>false</LinkIncremental>
+    <TargetName>EMSLS600Calib406</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;HAVE_INTTYPES_H=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\..\include;..\..\3rdParty\Apache\xerces\c\libx86\include;..\Common\include;..\..\3rdparty\XSD-3.3\include;..\3rdParty\Microsoft\msxml4_SP3;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>..\..\ConfigClientCPP\Debug;..\..\3rdParty\Apache\xerces\c\libx86\lib;..\Common\Library;..\.3rdparty\Microsoft\msxml4_SP3</AdditionalLibraryDirectories>
+      <AdditionalDependencies>xerces-c_3D.lib;EMSConfigClientCPP.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;HAVE_INTTYPES_H=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\..\include;..\..\3rdParty\Apache\xerces\c\libx86\include;..\Common\include;..\..\3rdparty\XSD-3.3\include;..\3rdParty\Microsoft\msxml4_SP3;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalLibraryDirectories>..\..\ConfigClientCPP\Debug;..\..\3rdParty\Apache\xerces\c\libx86\lib;..\Common\Library;..\.3rdparty\Microsoft\msxml4_SP3</AdditionalLibraryDirectories>
+      <AdditionalDependencies>xerces-c_3.lib;EMSConfigClientCPP.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <None Include="ReadMe.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="HGTCalibrateService.h" />
+    <ClInclude Include="stdafx.h" />
+    <ClInclude Include="targetver.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\Common\AOBJBASE.CPP" />
+    <ClCompile Include="..\Common\BCNCOUNT.CPP" />
+    <ClCompile Include="..\Common\CBcnMsgDecode.cpp" />
+    <ClCompile Include="..\Common\CBcnMsgDecodeBase.cpp" />
+    <ClCompile Include="..\Common\CBeaconID.cpp" />
+    <ClCompile Include="..\Common\CBeaconMessage.cpp" />
+    <ClCompile Include="..\Common\ccbootstrap.cpp" />
+    <ClCompile Include="..\Common\CMDSINK.CPP" />
+    <ClCompile Include="..\Common\ConfigurationAccessor.cpp" />
+    <ClCompile Include="..\Common\convutility.cpp" />
+    <ClCompile Include="..\Common\ecmdproc.CPP" />
+    <ClCompile Include="..\Common\EMSBCH.cpp" />
+    <ClCompile Include="..\Common\EMSBEACON.CPP" />
+    <ClCompile Include="..\Common\EMSBEACONBase.CPP" />
+    <ClCompile Include="..\Common\EMSBEACONDF.CPP" />
+    <ClCompile Include="..\Common\EMSBEACONID.CPP" />
+    <ClCompile Include="..\Common\EMSCLOCK.CPP" />
+    <ClCompile Include="..\Common\EMSCONFG.CPP" />
+    <ClCompile Include="..\Common\EMSCOORD.CPP" />
+    <ClCompile Include="..\Common\emsdomdocument.cpp" />
+    <ClCompile Include="..\Common\emsdomnode.cpp" />
+    <ClCompile Include="..\Common\emsdomnodelist.cpp" />
+    <ClCompile Include="..\Common\EMSEARTH.CPP" />
+    <ClCompile Include="..\Common\EMSEXCPT.CPP" />
+    <ClCompile Include="..\Common\EMSMUTEX.CPP" />
+    <ClCompile Include="..\Common\EMSRANGE.CPP" />
+    <ClCompile Include="..\Common\EMSRGKEY.CPP" />
+    <ClCompile Include="..\Common\emsthread.cpp" />
+    <ClCompile Include="..\Common\EMSTIME.CPP" />
+    <ClCompile Include="..\Common\EMSVECTR.CPP" />
+    <ClCompile Include="..\Common\Eservice.cpp" />
+    <ClCompile Include="..\Common\FileUtility.cpp" />
+    <ClCompile Include="..\Common\HexUtilis.cpp" />
+    <ClCompile Include="..\Common\LOGEVENT.CPP" />
+    <ClCompile Include="..\Common\Logger.cpp" />
+    <ClCompile Include="..\Common\LogHelper.cpp" />
+    <ClCompile Include="..\Common\LogMsgParam.cpp" />
+    <ClCompile Include="..\Common\LUTReceiverProperties.cpp" />
+    <ClCompile Include="..\Common\PKSINK.CPP" />
+    <ClCompile Include="..\Common\PKSOURCE.CPP" />
+    <ClCompile Include="..\Common\RegistrySettings.cpp" />
+    <ClCompile Include="..\Common\SARRTIME.CPP" />
+    <ClCompile Include="..\Common\SatelliteProperties.cpp" />
+    <ClCompile Include="HGTCalibrateService.cpp" />
+    <ClCompile Include="HGTCalibrationObj.cpp" />
+    <ClCompile Include="HGTCalibrationObjectsContainer.cpp" />
+    <ClCompile Include="HGTChannelCalibrationObj.cpp" />
+    <ClCompile Include="HGTLPCalibOutput.cpp" />
+    <ClCompile Include="HGTLPCalibrateEngine.cpp" />
+    <ClCompile Include="HGTRawCalibInput.cpp" />
+    <ClCompile Include="HGTSPCalibrateEngine.cpp" />
+    <ClCompile Include="RawLpCalibObj.cpp" />
+    <ClCompile Include="RawSpCalibObj.cpp" />
+    <ClCompile Include="RefBcns.cpp" />
+    <ClCompile Include="SarrCalibObj.cpp" />
+    <ClCompile Include="stdafx.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

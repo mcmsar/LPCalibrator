@@ -1,0 +1,55 @@
+# Visual Studio IDE cache / IntelliSense (regenerated locally, not source)
+.vs/
+*.sdf
+*.opensdf
+*.suo
+*.user
+*.aps
+*.ipch
+*.sbr
+*.bsc
+*.tlog
+*.idb
+
+# Compiler/linker intermediates and debug symbols
+Debug/
+Release/
+*.obj
+*.ilk
+*.exp
+*.res
+*.tmp
+*.pch
+*.pdb
+*.iobj
+*.ipdb
+*.pgc
+*.pgd
+
+# Legacy SVN metadata accidentally left in working copies
+.svn/
+
+# Editor/backup files
+*.bak
+
+# Debug/trace dumps and procmon captures (runtime output, not source)
+TSiDebugTrace*.txt
+procmon_output.txt
+EMSSatTrace*.csv
+EMSTraceSat*.csv
+EMSTraceDBFInput/
+EMSTraceDBFInputs/
+
+# Calibration bias-table dumps (regenerated at runtime, see
+# HGTCalibrationObjectsContainer::SaveSarrData/_Serialize)
+lscalibdata*.csv
+
+# Stale local backup copies of source files (not referenced by the .vcxproj)
+* - Copy.cpp
+* - Copy.h
+*_WKG.cpp
+*_wkg - Copy.cpp
+*_20th_Nov_2021
+
+# Local Claude Code settings (machine-specific, not shared project config)
+.claude/settings.local.json

@@ -57,7 +57,8 @@ const ULONG	 c_ulConvergenceTestCount = 10;
 //For DBF
 //const double c_dFreqDBFoffset  = 11177.0 ;
 const double c_dFreqDBFoffset  = 0.0 ;
-const double c_dMinFoaResidual = 150.0;
+const double c_dMinFoaResidual = 200.0;
+//const double c_dMinFoaResidual = 5.0;
 //const double c_dMinElevation = 10.0;
 const double c_dMinElevation = 0.0; // 16th Nov 2021
 const double c_dSAthreshold  = 7.0; // Minimum allowed satellite separation angle

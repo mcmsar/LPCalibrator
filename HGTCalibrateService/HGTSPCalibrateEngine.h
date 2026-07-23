@@ -30,6 +30,7 @@
 #include "PointerMap.h"
 #include "HGTChannelCalibrationObj.h"
 #include <string>
+#include <vector>
 
 //! Engine to processes SP Calib406 data.
 class CHGTSPCalibrateEngine : public CEMSThread
@@ -72,6 +73,11 @@ class CHGTSPCalibrateEngine : public CEMSThread
 		std::string _CreateMapKey( ULONG ulLutId, WORD wAntId, ULONG ulConstellation );
 		void _PopulateRawSpCalibObj();
 		void _PopulateRawSpCalibObjList( CEMSPointerList<CEMSRawSpCalibObj>&  lstCalibObj );
+		void _AddToCrossChannelBuffer( CEMSPointerList<CEMSRawSpCalibObj>&  lstNewCalibObj );
+		void _ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawSpCalibObj>&  lstReadyCalibObj );
+		void _RecordDispatch( ULONG ulLutId, ULONG ulSatId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency );
+		bool _IsLateArrivalDuplicate( ULONG ulLutId, ULONG ulSatId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency );
+		void _PurgeRecentDispatchHistory();
 		void _PopulateChannelCalibObj( CEMSRawSpCalibObj*  pCalibObj );
 		void _PerformSpCalibration();
 		void _OutputCalibratedData(CEMSPointerList<CEMSRawLpCalibObj>& olstCalib);
@@ -93,6 +99,31 @@ class CHGTSPCalibrateEngine : public CEMSThread
 
 		//
 		CEMSPointerList<CEMSRawSpCalibObj> m_lstInputSpCalib;
+
+		// Cross-channel (cross-antenna) duplicate-detection hold buffer: every
+		// incoming record waits here up to c_i64CrossChannelBufferNanos before
+		// being routed to a per-channel calibration object, so a duplicate
+		// arriving on a later tick still has a chance to be matched. See
+		// _ResolveCrossChannelBuffer.
+		CEMSPointerList<CEMSRawSpCalibObj> m_lstCrossChannelBuffer;
+
+		// Extended lookback for late-arriving duplicates that miss the live
+		// buffer entirely (e.g. one copy took a slower path to the engine and
+		// showed up more than the 30s hold window after its partner was
+		// already dispatched). Plain value-typed bookkeeping, not the raw
+		// ref-counted calib objects - only the fields needed to recognize a
+		// late match are kept. See _RecordDispatch/_IsLateArrivalDuplicate.
+		struct _RecentDispatch
+		{
+			ULONG   ulLutId;
+			ULONG   ulSatId;
+			INT64   i64BcnId;
+			INT64   i64ReceiveTimeNanos;
+			double  dFrequency;
+			EMSTIME timeDispatched;
+		};
+		std::vector<_RecentDispatch> m_vecRecentDispatchHistory;
+
 		CEMSPointerMap<std::string, CHGTChannelCalibrationObj> m_mapCalibrateChannels;
 		CEMSPointerList<CEMSRawLpCalibObj>             m_lstOutputCalibData;
 		CEMSPointerList<CEMSSarrCalibObj>            m_lstOutputFcalData;

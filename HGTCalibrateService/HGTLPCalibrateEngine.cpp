@@ -24,6 +24,9 @@
 #include "HGTLPCalibrateEngine.h"
 #include "TSiDebugTrace.h"
 #include "calib406msg.h"
+#include <vector>
+#include <map>
+#include <set>
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -31,6 +34,69 @@
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 const ULONG CHGTLPCalibrateEngine::ms_culTimeout = 100;		// 100 millisecs
+
+// Cross-channel (cross-antenna) duplicate-detection buffer: every incoming LP
+// record is held for this long before being routed onward, so a duplicate
+// arriving on a later processing tick still gets a chance to be matched
+// against it. Two records for the same LUT+beacon ID, whose receive time and
+// frequency are within the tolerances below, are treated as the same physical
+// detection seen by more than one antenna -- whichever has the higher CNR
+// (carrier power) is kept, the other is dropped and never reaches a
+// per-channel calibration object. Tune all three based on observed data:
+// the hold window trades detection latency for how late a duplicate can
+// still arrive and be caught; the tolerances trade false-negative risk
+// (missed duplicates) against false-positive risk (distinct beacons wrongly
+// merged).
+static const INT64  c_i64CrossChannelBufferNanos                = 30000000000;  // 30 s hold window
+static const INT64  c_i64CrossChannelReceiveTimeToleranceNanos  = 2000000;       // 2 ms leeway
+static const double c_dCrossChannelFrequencyToleranceHz         = 5.0;           // 5 Hz leeway
+
+// A duplicate whose two copies reach the engine more than the 30s hold window
+// apart (e.g. one took a slower path upstream) would otherwise be missed
+// entirely: the first copy ages out and dispatches as an "unmatched unique"
+// before the second ever arrives to compare against. This extended lookback
+// remembers what's already been dispatched so a late straggler can still be
+// recognized and dropped, rather than being sent through as a second
+// "unique" detection of the same event. Unlike the live buffer, a match here
+// always drops the late arrival outright (the earlier copy already went out
+// and can't be recalled, so there's no "keep the higher CNR" choice left to
+// make) - the tradeoff is a small risk of keeping the lower-CNR copy on the
+// rare occasion the better one is the late arrival.
+static const INT64  c_i64RecentDispatchHistoryNanos             = 300000000000; // 5 min lookback
+
+namespace
+{
+	struct _LpDupCandidate
+	{
+		CEMSRawLpCalibObj* pObj;
+		ULONG   ulLutId;
+		WORD    wAntId;
+		ULONG   ulSatId;
+		INT64   i64BcnId;
+		INT64   i64ReceiveTimeNanos;
+		double  dFrequency;
+		double  dCarrierPower;
+		EMSTIME timeStored;
+	};
+
+	size_t _UfFind( std::vector<size_t>& vecParent, size_t x )
+	{
+		while( vecParent[x] != x )
+		{
+			vecParent[x] = vecParent[ vecParent[x] ];
+			x = vecParent[x];
+		}
+		return x;
+	}
+
+	void _UfUnion( std::vector<size_t>& vecParent, size_t a, size_t b )
+	{
+		size_t ra = _UfFind( vecParent, a );
+		size_t rb = _UfFind( vecParent, b );
+		if( ra != rb )
+			vecParent[ra] = rb;
+	}
+}
 
 
 CHGTLPCalibrateEngine::CHGTLPCalibrateEngine() :  m_bRunning(false)
@@ -190,21 +256,328 @@ CHGTLPCalibrateEngine::_PopulateChannelCalibObj( CEMSRawLpCalibObj*  pCalibData 
 }
 
 void
+CHGTLPCalibrateEngine::_AddToCrossChannelBuffer( CEMSPointerList<CEMSRawLpCalibObj>&  lstNewCalibObj )
+{
+	CEMSRawLpCalibObj* pObj = NULL;
+
+	try
+	{
+		if( lstNewCalibObj.Count() == 0 )
+			return;
+
+		lstNewCalibObj.MoveFirst();
+		while( pObj = lstNewCalibObj.GetNext() )
+		{
+			// Stamp with the time it entered the hold buffer (reusing the same
+			// GetTimeStored()/SetTimeStored() bookkeeping the per-channel
+			// retransmit-history map already uses) so its 30s window can be
+			// aged against the wall clock later.
+			pObj->SetTimeStored( CEMSSystemClock::GetTime() );
+			m_lstCrossChannelBuffer.Add( pObj );
+
+			lstNewCalibObj.RemoveCurrent();
+			pObj->Release();
+			pObj = NULL;
+		}
+	}
+	catch( ... )
+	{
+		CTSiDebugTrace::LogAlways("*** EXCEPTION in _AddToCrossChannelBuffer ***");
+		if( pObj )
+		{
+			pObj->Release();
+			pObj = NULL;
+		}
+		throw;
+	}
+}
+
+void
+CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCalibObj>&  lstReadyCalibObj )
+{
+	// Best-effort: a failure here must never take the whole LP path down with
+	// it, so exceptions are logged and swallowed rather than propagated -
+	// worst case, nothing ages out of the buffer this tick and it's retried
+	// on the next one.
+	try
+	{
+		if( m_lstCrossChannelBuffer.Count() == 0 )
+			return;
+
+		// Snapshot the current buffer contents for matching. GetNext() AddRef()s
+		// each object; the buffer itself still holds its own reference, so it's
+		// safe to Release() our extra ref right after copying the fields out.
+		std::vector<_LpDupCandidate> vecCandidates;
+		CEMSRawLpCalibObj* pObj = NULL;
+
+		m_lstCrossChannelBuffer.MoveFirst();
+		while( pObj = m_lstCrossChannelBuffer.GetNext() )
+		{
+			_LpDupCandidate cand;
+			cand.pObj               = pObj;
+			cand.ulLutId            = pObj->GetLutId();
+			cand.wAntId             = pObj->GetAntennaId();
+			cand.ulSatId            = pObj->GetSatId();
+			cand.i64BcnId           = pObj->GetBcnId();
+			cand.i64ReceiveTimeNanos = pObj->GetTimeMsg().intTime;
+			cand.dFrequency         = pObj->GetFrequency();
+			cand.dCarrierPower      = pObj->GetCarrierPower();
+			cand.timeStored         = pObj->GetTimeStored();
+
+			vecCandidates.push_back( cand );
+
+			pObj->Release();
+			pObj = NULL;
+		}
+
+		// Group by LutId+SatId+BeaconID ("matching beaconID") first - all three
+		// are exact matches, so this cheaply narrows down the pairs that then
+		// need the receive-time/frequency closeness check. SatId must be part
+		// of the key: the same beacon transmission is routinely relayed
+		// independently by more than one satellite (that's the basis of
+		// multilateration), and those are distinct detections, not duplicates
+		// - only redundant copies of the *same* satellite's downlink (seen via
+		// more than one ground antenna) are meant to collapse here.
+		std::map<std::string, std::vector<size_t> > mapGroups;
+		char szKey[128];
+		for( size_t i = 0; i < vecCandidates.size(); i++ )
+		{
+			sprintf( szKey, "%lu_%lu_%I64X", vecCandidates[i].ulLutId, vecCandidates[i].ulSatId, vecCandidates[i].i64BcnId );
+			mapGroups[ std::string(szKey) ].push_back( i );
+		}
+
+		// Union-find over candidate indices, so chains of near-identical
+		// detections (A close to B, B close to C) collapse into one cluster
+		// instead of being resolved as inconsistent pairwise decisions.
+		std::vector<size_t> vecParent( vecCandidates.size() );
+		for( size_t i = 0; i < vecParent.size(); i++ )
+			vecParent[i] = i;
+
+		for( std::map<std::string, std::vector<size_t> >::iterator itGroup = mapGroups.begin(); itGroup != mapGroups.end(); ++itGroup )
+		{
+			std::vector<size_t>& vecIdx = itGroup->second;
+			if( vecIdx.size() < 2 )
+				continue;
+
+			for( size_t a = 0; a < vecIdx.size(); a++ )
+			{
+				for( size_t b = a + 1; b < vecIdx.size(); b++ )
+				{
+					const _LpDupCandidate& ca = vecCandidates[ vecIdx[a] ];
+					const _LpDupCandidate& cb = vecCandidates[ vecIdx[b] ];
+
+					INT64 i64TimeDiff = ca.i64ReceiveTimeNanos - cb.i64ReceiveTimeNanos;
+					if( i64TimeDiff < 0 )
+						i64TimeDiff = -i64TimeDiff;
+
+					double dFreqDiff = ca.dFrequency - cb.dFrequency;
+					if( dFreqDiff < 0.0 )
+						dFreqDiff = -dFreqDiff;
+
+					if( i64TimeDiff <= c_i64CrossChannelReceiveTimeToleranceNanos &&
+						dFreqDiff  <= c_dCrossChannelFrequencyToleranceHz )
+					{
+						_UfUnion( vecParent, vecIdx[a], vecIdx[b] );
+					}
+				}
+			}
+		}
+
+		// Best (highest-CNR) candidate per cluster.
+		std::map<size_t, size_t> mapBestInCluster; // root index -> best index
+		for( size_t i = 0; i < vecCandidates.size(); i++ )
+		{
+			size_t root = _UfFind( vecParent, i );
+			std::map<size_t, size_t>::iterator itBest = mapBestInCluster.find( root );
+			if( itBest == mapBestInCluster.end() )
+			{
+				mapBestInCluster[root] = i;
+			}
+			else if( vecCandidates[i].dCarrierPower > vecCandidates[ itBest->second ].dCarrierPower )
+			{
+				itBest->second = i;
+			}
+		}
+
+		// A cluster is ready to resolve once ANY of its members has been sitting
+		// in the buffer for the full 30s hold window - once a match is confirmed
+		// there's no reason to wait out the rest. An unmatched (singleton)
+		// candidate is ready once it alone reaches 30s old ("after 30s, if there
+		// are no duplicates, it is safe to move the detection on").
+		EMSTIME timeNow = CEMSSystemClock::GetTime();
+		std::set<size_t> setClustersReady;
+		for( size_t i = 0; i < vecCandidates.size(); i++ )
+		{
+			INT64 i64AgeNanos = timeNow.intTime - vecCandidates[i].timeStored.intTime;
+			if( i64AgeNanos >= c_i64CrossChannelBufferNanos )
+				setClustersReady.insert( _UfFind( vecParent, i ) );
+		}
+
+		if( setClustersReady.empty() )
+		{
+			_PurgeRecentDispatchHistory();
+			return;
+		}
+
+		std::set<CEMSRawLpCalibObj*> setSurvivors;
+		std::set<CEMSRawLpCalibObj*> setToDrop;
+
+		for( size_t i = 0; i < vecCandidates.size(); i++ )
+		{
+			size_t root = _UfFind( vecParent, i );
+			if( setClustersReady.find( root ) == setClustersReady.end() )
+				continue; // this cluster hasn't reached its 30s window yet
+
+			size_t best = mapBestInCluster[root];
+			if( i == best )
+			{
+				// Before treating this as a fresh detection, check it isn't a
+				// late straggler duplicating something already dispatched
+				// minutes ago - that pair would never have been in the live
+				// buffer together to be caught above.
+				if( _IsLateArrivalDuplicate( vecCandidates[i].ulLutId, vecCandidates[i].ulSatId, vecCandidates[i].i64BcnId,
+				                              vecCandidates[i].i64ReceiveTimeNanos, vecCandidates[i].dFrequency ) )
+				{
+					setToDrop.insert( vecCandidates[i].pObj );
+
+					CTSiDebugTrace::LogFmtAlways(
+						"LP LATE-ARRIVAL DUP: dropping BcnId=%016I64X LutId=%lu AntId=%u Freq=%.3f CNR=%.2f "
+						"(matches a detection already dispatched earlier - missed the live 30s buffer window)",
+						vecCandidates[i].i64BcnId, vecCandidates[i].ulLutId,
+						(unsigned)vecCandidates[i].wAntId, vecCandidates[i].dFrequency, vecCandidates[i].dCarrierPower );
+				}
+				else
+				{
+					setSurvivors.insert( vecCandidates[i].pObj );
+				}
+			}
+			else
+			{
+				setToDrop.insert( vecCandidates[i].pObj );
+
+				CTSiDebugTrace::LogFmtAlways(
+					"LP CROSS-CHANNEL DUP: dropping BcnId=%016I64X LutId=%lu AntId=%u Freq=%.3f CNR=%.2f "
+					"(kept AntId=%u Freq=%.3f CNR=%.2f)",
+					vecCandidates[i].i64BcnId, vecCandidates[i].ulLutId,
+					(unsigned)vecCandidates[i].wAntId, vecCandidates[i].dFrequency, vecCandidates[i].dCarrierPower,
+					(unsigned)vecCandidates[best].wAntId, vecCandidates[best].dFrequency, vecCandidates[best].dCarrierPower );
+			}
+		}
+
+		// Pull every resolved cluster's members out of the buffer; hand the
+		// survivors back to the caller for dispatch (recording each one so a
+		// still-later straggler can be caught too), drop the rest.
+		if( !setSurvivors.empty() || !setToDrop.empty() )
+		{
+			m_lstCrossChannelBuffer.MoveFirst();
+			while( pObj = m_lstCrossChannelBuffer.GetNext() )
+			{
+				if( setSurvivors.find( pObj ) != setSurvivors.end() )
+				{
+					_RecordDispatch( pObj->GetLutId(), pObj->GetSatId(), pObj->GetBcnId(), pObj->GetTimeMsg().intTime, pObj->GetFrequency() );
+					lstReadyCalibObj.Add( pObj );
+					m_lstCrossChannelBuffer.RemoveCurrent();
+				}
+				else if( setToDrop.find( pObj ) != setToDrop.end() )
+				{
+					m_lstCrossChannelBuffer.RemoveCurrent();
+				}
+				pObj->Release();
+				pObj = NULL;
+			}
+		}
+
+		_PurgeRecentDispatchHistory();
+	}
+	catch( ... )
+	{
+		CTSiDebugTrace::LogAlways("*** EXCEPTION in _ResolveCrossChannelBuffer ***");
+	}
+}
+
+void
+CHGTLPCalibrateEngine::_RecordDispatch( ULONG ulLutId, ULONG ulSatId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency )
+{
+	_RecentDispatch entry;
+	entry.ulLutId            = ulLutId;
+	entry.ulSatId            = ulSatId;
+	entry.i64BcnId           = i64BcnId;
+	entry.i64ReceiveTimeNanos = i64ReceiveTimeNanos;
+	entry.dFrequency         = dFrequency;
+	entry.timeDispatched     = CEMSSystemClock::GetTime();
+
+	m_vecRecentDispatchHistory.push_back( entry );
+}
+
+bool
+CHGTLPCalibrateEngine::_IsLateArrivalDuplicate( ULONG ulLutId, ULONG ulSatId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency )
+{
+	for( size_t i = 0; i < m_vecRecentDispatchHistory.size(); i++ )
+	{
+		const _RecentDispatch& hist = m_vecRecentDispatchHistory[i];
+
+		if( hist.ulLutId != ulLutId || hist.ulSatId != ulSatId || hist.i64BcnId != i64BcnId )
+			continue;
+
+		INT64 i64TimeDiff = i64ReceiveTimeNanos - hist.i64ReceiveTimeNanos;
+		if( i64TimeDiff < 0 )
+			i64TimeDiff = -i64TimeDiff;
+
+		double dFreqDiff = dFrequency - hist.dFrequency;
+		if( dFreqDiff < 0.0 )
+			dFreqDiff = -dFreqDiff;
+
+		if( i64TimeDiff <= c_i64CrossChannelReceiveTimeToleranceNanos &&
+			dFreqDiff  <= c_dCrossChannelFrequencyToleranceHz )
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void
+CHGTLPCalibrateEngine::_PurgeRecentDispatchHistory()
+{
+	if( m_vecRecentDispatchHistory.empty() )
+		return;
+
+	EMSTIME timeNow = CEMSSystemClock::GetTime();
+	std::vector<_RecentDispatch> vecKept;
+	vecKept.reserve( m_vecRecentDispatchHistory.size() );
+
+	for( size_t i = 0; i < m_vecRecentDispatchHistory.size(); i++ )
+	{
+		INT64 i64AgeNanos = timeNow.intTime - m_vecRecentDispatchHistory[i].timeDispatched.intTime;
+		if( i64AgeNanos < c_i64RecentDispatchHistoryNanos )
+			vecKept.push_back( m_vecRecentDispatchHistory[i] );
+	}
+
+	m_vecRecentDispatchHistory.swap( vecKept );
+}
+
+void
 CHGTLPCalibrateEngine::_PopulateRawLpCalibObjList( CEMSPointerList<CEMSRawLpCalibObj>&  lstCalibObj )
 {
 	CEMSRawLpCalibObj* pCalibObject = NULL;
-	
+
 	try
 	{
-		if( lstCalibObj.Count() > 0 )
+		_AddToCrossChannelBuffer( lstCalibObj );
+
+		CEMSPointerList<CEMSRawLpCalibObj> lstReadyCalibObj;
+		_ResolveCrossChannelBuffer( lstReadyCalibObj );
+
+		if( lstReadyCalibObj.Count() > 0 )
 		{
-			lstCalibObj.MoveFirst();
-			while( pCalibObject = lstCalibObj.GetNext() )
+			lstReadyCalibObj.MoveFirst();
+			while( pCalibObject = lstReadyCalibObj.GetNext() )
 			{
 				_PopulateChannelCalibObj( pCalibObject );
 
-				lstCalibObj.RemoveCurrent();
-				
+				lstReadyCalibObj.RemoveCurrent();
+
 				pCalibObject->Release();
 				pCalibObject = NULL;
 			}

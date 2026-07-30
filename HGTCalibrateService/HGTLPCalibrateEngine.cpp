@@ -71,7 +71,6 @@ namespace
 		CEMSRawLpCalibObj* pObj;
 		ULONG   ulLutId;
 		WORD    wAntId;
-		ULONG   ulSatId;
 		INT64   i64BcnId;
 		INT64   i64ReceiveTimeNanos;
 		double  dFrequency;
@@ -317,7 +316,6 @@ CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCali
 			cand.pObj               = pObj;
 			cand.ulLutId            = pObj->GetLutId();
 			cand.wAntId             = pObj->GetAntennaId();
-			cand.ulSatId            = pObj->GetSatId();
 			cand.i64BcnId           = pObj->GetBcnId();
 			cand.i64ReceiveTimeNanos = pObj->GetTimeMsg().intTime;
 			cand.dFrequency         = pObj->GetFrequency();
@@ -330,19 +328,26 @@ CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCali
 			pObj = NULL;
 		}
 
-		// Group by LutId+SatId+BeaconID ("matching beaconID") first - all three
-		// are exact matches, so this cheaply narrows down the pairs that then
-		// need the receive-time/frequency closeness check. SatId must be part
-		// of the key: the same beacon transmission is routinely relayed
-		// independently by more than one satellite (that's the basis of
-		// multilateration), and those are distinct detections, not duplicates
-		// - only redundant copies of the *same* satellite's downlink (seen via
-		// more than one ground antenna) are meant to collapse here.
+		// Group by LutId+BeaconID ("matching beaconID") first - both are exact
+		// matches, so this cheaply narrows down the pairs that then need the
+		// receive-time/frequency closeness check. Deliberately NOT keying on
+		// SatId: at this point in the pipeline (before _GetDBFSatellite has
+		// run) GetSatId() is only a per-antenna provisional tag, not the
+		// resolved satellite - it can differ across antennas for the exact
+		// same physical detection (confirmed from live data: one beacon, one
+		// instant, one frequency, four antennas, four different SatId
+		// values). Keying on it here silently split genuine duplicates into
+		// separate "unique" buckets instead of collapsing them. Cross-
+		// satellite collisions (different satellites relaying the same
+		// beacon ID) are still guarded against by the receive-time/frequency
+		// tolerances below - different satellites impart different Doppler
+		// shifts on the same 406 MHz beacon, so their raw frequencies
+		// generally differ by far more than the 5 Hz tolerance.
 		std::map<std::string, std::vector<size_t> > mapGroups;
 		char szKey[128];
 		for( size_t i = 0; i < vecCandidates.size(); i++ )
 		{
-			sprintf( szKey, "%lu_%lu_%I64X", vecCandidates[i].ulLutId, vecCandidates[i].ulSatId, vecCandidates[i].i64BcnId );
+			sprintf( szKey, "%lu_%I64X", vecCandidates[i].ulLutId, vecCandidates[i].i64BcnId );
 			mapGroups[ std::string(szKey) ].push_back( i );
 		}
 
@@ -435,7 +440,7 @@ CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCali
 				// late straggler duplicating something already dispatched
 				// minutes ago - that pair would never have been in the live
 				// buffer together to be caught above.
-				if( _IsLateArrivalDuplicate( vecCandidates[i].ulLutId, vecCandidates[i].ulSatId, vecCandidates[i].i64BcnId,
+				if( _IsLateArrivalDuplicate( vecCandidates[i].ulLutId, vecCandidates[i].i64BcnId,
 				                              vecCandidates[i].i64ReceiveTimeNanos, vecCandidates[i].dFrequency ) )
 				{
 					setToDrop.insert( vecCandidates[i].pObj );
@@ -474,7 +479,7 @@ CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCali
 			{
 				if( setSurvivors.find( pObj ) != setSurvivors.end() )
 				{
-					_RecordDispatch( pObj->GetLutId(), pObj->GetSatId(), pObj->GetBcnId(), pObj->GetTimeMsg().intTime, pObj->GetFrequency() );
+					_RecordDispatch( pObj->GetLutId(), pObj->GetBcnId(), pObj->GetTimeMsg().intTime, pObj->GetFrequency() );
 					lstReadyCalibObj.Add( pObj );
 					m_lstCrossChannelBuffer.RemoveCurrent();
 				}
@@ -496,11 +501,10 @@ CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCali
 }
 
 void
-CHGTLPCalibrateEngine::_RecordDispatch( ULONG ulLutId, ULONG ulSatId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency )
+CHGTLPCalibrateEngine::_RecordDispatch( ULONG ulLutId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency )
 {
 	_RecentDispatch entry;
 	entry.ulLutId            = ulLutId;
-	entry.ulSatId            = ulSatId;
 	entry.i64BcnId           = i64BcnId;
 	entry.i64ReceiveTimeNanos = i64ReceiveTimeNanos;
 	entry.dFrequency         = dFrequency;
@@ -510,13 +514,13 @@ CHGTLPCalibrateEngine::_RecordDispatch( ULONG ulLutId, ULONG ulSatId, INT64 i64B
 }
 
 bool
-CHGTLPCalibrateEngine::_IsLateArrivalDuplicate( ULONG ulLutId, ULONG ulSatId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency )
+CHGTLPCalibrateEngine::_IsLateArrivalDuplicate( ULONG ulLutId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency )
 {
 	for( size_t i = 0; i < m_vecRecentDispatchHistory.size(); i++ )
 	{
 		const _RecentDispatch& hist = m_vecRecentDispatchHistory[i];
 
-		if( hist.ulLutId != ulLutId || hist.ulSatId != ulSatId || hist.i64BcnId != i64BcnId )
+		if( hist.ulLutId != ulLutId || hist.i64BcnId != i64BcnId )
 			continue;
 
 		INT64 i64TimeDiff = i64ReceiveTimeNanos - hist.i64ReceiveTimeNanos;

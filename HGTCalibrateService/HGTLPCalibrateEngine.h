@@ -72,8 +72,8 @@ class CHGTLPCalibrateEngine : public CEMSThread
 		void _PopulateRawLpCalibObjList( CEMSPointerList<CEMSRawLpCalibObj>&  lstCalibObj );
 		void _AddToCrossChannelBuffer( CEMSPointerList<CEMSRawLpCalibObj>&  lstNewCalibObj );
 		void _ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCalibObj>&  lstReadyCalibObj );
-		void _RecordDispatch( ULONG ulLutId, ULONG ulSatId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency );
-		bool _IsLateArrivalDuplicate( ULONG ulLutId, ULONG ulSatId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency );
+		void _RecordDispatch( ULONG ulLutId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency );
+		bool _IsLateArrivalDuplicate( ULONG ulLutId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency );
 		void _PurgeRecentDispatchHistory();
 		void _PopulateChannelCalibObj( CEMSRawLpCalibObj*  pCalibObj );
 		void _PerformLpCalibration();
@@ -112,7 +112,6 @@ class CHGTLPCalibrateEngine : public CEMSThread
 		struct _RecentDispatch
 		{
 			ULONG   ulLutId;
-			ULONG   ulSatId;
 			INT64   i64BcnId;
 			INT64   i64ReceiveTimeNanos;
 			double  dFrequency;

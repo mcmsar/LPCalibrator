@@ -31,12 +31,15 @@ public:
         m_bDebugEnabled = (GetFileAttributesA(szDebugFlagPath) != INVALID_FILE_ATTRIBUTES);
 
         // Verbose logging is high-volume, so it gets a tighter retention window;
-        // with only the curated "Always" events, 24 hours stays manageable.
-        m_i64RetentionSeconds = m_bDebugEnabled ? (12 * 3600) : (24 * 3600);
+        // with only the curated "Always" events, a week stays manageable.
+        m_i64RetentionSeconds = m_bDebugEnabled ? (12 * 3600) : (7 * 24 * 3600);
 
-        // Use _fsopen with _SH_DENYNO so a second instance can still overwrite the file
-        // even if a previous instance crashed while holding it open.
-        m_lpFile = _fsopen(szPath, "w", _SH_DENYNO);
+        // Append rather than truncate, so a service restart doesn't discard
+        // whatever was logged before it - retention pruning (_MaybePruneLocked)
+        // is what keeps the file bounded, not a fresh start on every Open().
+        // Use _fsopen with _SH_DENYNO so a second instance can still write the
+        // file even if a previous instance crashed while holding it open.
+        m_lpFile = _fsopen(szPath, "a", _SH_DENYNO);
         if (m_lpFile)
         {
             _WriteHeaderLocked();
@@ -141,6 +144,13 @@ private:
     static void _WriteHeaderLocked()
     {
         if (!m_lpFile) return;
+
+        // In append mode the file may already hold entries from a prior run;
+        // a leading blank line keeps this session's banner visually separated
+        // from whatever was written before the restart. _ftelli64 reports the
+        // current (post-open) size, so it's 0 only for a brand-new file.
+        if (_ftelli64(m_lpFile) > 0)
+            fprintf(m_lpFile, "\n");
 
         SYSTEMTIME st;
         GetLocalTime(&st);

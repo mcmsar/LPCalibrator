@@ -59,6 +59,16 @@ class CHGTLPCalibOutput : public CEMSThread
 
 		EMS_RESULT _CreateObjects( void );
 		void _ReleaseObjects( void );
+
+		// Test-only override for the FOA output gate in _OutputRawLPCalibData.
+		// Read once at Start() from a marker file (see .cpp for path/format) so
+		// it can't be silently reverted by the periodic lscalibdata.csv
+		// round-trip (SaveSarrData/_Serialize rewrites that file from
+		// in-memory state on a timer and never re-reads it, so hand edits to
+		// the CSV while the service is running get overwritten within a
+		// couple of minutes). Delete the marker file and restart to go back
+		// to the normal per-antenna configured threshold.
+		static void _LoadFoaThresholdOverride();
 		
 		void _GetRawLPCalibObjList( CEMSPointerList<CEMSRawLpCalibObj>& rolstRawLPCalib );
 		void _GetSARRCalibObjList( CEMSPointerList<CEMSSarrCalibObj>& rolstSarrCalib );
@@ -89,6 +99,9 @@ class CHGTLPCalibOutput : public CEMSThread
 		static const ULONG		ms_culTimeout;
 		static const ULONG		ms_culsleepTime;
 		static const ULONG		ms_culMaxRetries;
+
+		static bool				ms_bFoaThresholdOverrideEnabled;
+		static double			ms_dFoaThresholdOverride;
 };
 
 #endif

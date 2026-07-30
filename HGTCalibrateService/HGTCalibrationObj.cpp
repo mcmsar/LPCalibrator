@@ -59,9 +59,23 @@ const ULONG	 c_ulConvergenceTestCount = 10;
 const double c_dFreqDBFoffset  = 0.0 ;
 const double c_dMinFoaResidual = 200.0;
 //const double c_dMinFoaResidual = 5.0;
-//const double c_dMinElevation = 10.0;
-const double c_dMinElevation = 0.0; // 16th Nov 2021
+// Restored from 0.0 (set 16th Nov 2021) - near-horizon candidates are exactly
+// where neighboring orbital planes' Doppler curves are most likely to cross,
+// which is when _GetDBFSatellite is most prone to picking the wrong
+// satellite (see c_dFoaAmbiguityMarginHz below).
+const double c_dMinElevation = 10.0;
 const double c_dSAthreshold  = 7.0; // Minimum allowed satellite separation angle
+
+// _GetDBFSatellite picks whichever candidate satellite has the smallest FOA
+// residual out of a ~36-satellite sweep, with no check on how much better it
+// is than the runner-up. When two candidates are within this margin of each
+// other, treat the pick as ambiguous rather than trusting whichever one is
+// fractionally smaller on this one noisy sample - real captured 200kHz/1s
+// buffer data (satellites 405/418 on 2026-07-27, 409/418 on 2026-07-28) show
+// the same beacon's detections genuinely flipping between two satellite IDs,
+// including several at the exact same timestamp. Starting value is a guess;
+// tune from the "AMBIGUOUS"/"HYSTERESIS" trace lines this produces.
+const double c_dFoaAmbiguityMarginHz = 20.0;
 
 CHGTCalibrationObj::CHGTCalibrationObj() :  CApiObjBase( TEXT("CHGTCalibrationObj") ),m_lpOrbit(NULL)
 											
@@ -1609,9 +1623,25 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 
 	HGTLSCALIBDATA lsCalibData;
 
+	// Hysteresis: the satellite this beam was already locked to, so a later
+	// ambiguous pick can prefer staying put over chattering to whichever
+	// candidate is fractionally smaller on this one sample. 0 means "never
+	// locked yet" (see GetDBFBestSatellite's non-ref-beacon branch, which
+	// treats 0 the same way).
+	ULONG  ulIncumbentSatellite  = m_ulArrBeamId[ulBeamID];
+	bool   bIncumbentEvaluated   = false;
+	double dIncumbentFoaResidual = 0.0;
+	double dIncumbentToaResidual = 0.0;
+
 
 	for(ULONG ulSat = ulMinSat; ulSat <= ulMaxSat ; ulSat++)
 	{
+		// Which stage rejected this candidate, for the REJECTED log line below -
+		// added specifically so "did the restored elevation floor actually
+		// change anything" is a directly observable count instead of an
+		// inference from an aggregate rejection ratio.
+		const char* pszRejectReason = "unknown";
+
 		// Reset original field data
 		pRawLpCalibObj->SetFrequency(dFOAinitial);
 		pRawLpCalibObj->SetFreqOffset(dFreqOffsetInitial);
@@ -1620,18 +1650,29 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 		pRawLpCalibObj->SetSatId(ulSat);
 
 		hr = _OrbitUpdate(pRawLpCalibObj);
-		
+		if( hr != EMS_OK )
+			pszRejectReason = "orbit update";
+
 		dElevation = 0.0;
 		if(hr == EMS_OK )
 		{
 			hr = _SetGSAzimuthElevation(pRawLpCalibObj);
+			if( hr != EMS_OK )
+				pszRejectReason = "azimuth/elevation calc";
 			dElevation = pRawLpCalibObj->GetElevation();
 			if(dElevation < c_dMinElevation)
+			{
 				hr = EMS_FALSE;
+				pszRejectReason = "below elevation floor";
+			}
 		}
 
 		if(hr == EMS_OK )
-			hr = _CorrectDownLink(pRawLpCalibObj); 
+		{
+			hr = _CorrectDownLink(pRawLpCalibObj);
+			if( hr != EMS_OK )
+				pszRejectReason = "downlink correction";
+		}
 
 		if(hr == EMS_OK )
 		{
@@ -1641,21 +1682,37 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 																				pRawLpCalibObj->GetAntennaId(),
 																				ulSat, &lsCalibData);
 			hr = _AdjustDBFSarrFreqAndTime( pRawLpCalibObj, lsCalibData, ulSat );
+			if( hr != EMS_OK )
+				pszRejectReason = "DBF SARR freq/time adjust";
 		}
 
 		if( hr == EMS_OK )
 		{
 			EMSRANGERATED rangeRateUL;
-			hr = CEMSRangeRate::Calculate( pRawLpCalibObj->GetBcnVector(), 
+			hr = CEMSRangeRate::Calculate( pRawLpCalibObj->GetBcnVector(),
 											&pRawLpCalibObj->GetSatPVC(), 1, &rangeRateUL );
+			if( hr != EMS_OK )
+				pszRejectReason = "range-rate calculation";
 
 			hr = _CalcTimeResidual( rangeRateUL, pRawLpCalibObj );
+			if( hr != EMS_OK )
+				pszRejectReason = "time residual calc";
 
 			hr = _CalcFreqResidual( rangeRateUL, pRawLpCalibObj );
+			if( hr != EMS_OK )
+				pszRejectReason = "freq residual calc";
 
 			dTestFrqResidual = pRawLpCalibObj->GetResidualFrequency();
 
 			dTestTimeResidual = pRawLpCalibObj->GetResidualTime();
+
+			if( (ulSat == ulIncumbentSatellite) && (ulIncumbentSatellite != 0) )
+			{
+				dIncumbentFoaResidual = dTestFrqResidual;
+				dIncumbentToaResidual = dTestTimeResidual;
+				bIncumbentEvaluated = true;
+			}
+
 			if ( (dTestTimeResidual > 0.2) &&  (dTestTimeResidual < 0.24) )
 			{
 				dTestTimeResidual -= 0.22;
@@ -1712,33 +1769,83 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 		}
 		else
 		{
-			// Candidate satellite rejected somewhere in the chain above
-			// (orbit/TLE unavailable, below-horizon, downlink correction
-			// failure, or it simply didn't beat the current best match) -
-			// record which satellite and why so a bad candidate can be told
-			// apart from a bad site/config.
+			// Candidate satellite rejected somewhere in the chain above -
+			// pszRejectReason names the specific stage so a bad candidate can
+			// be told apart from a bad site/config, and so the elevation
+			// floor's actual effect (c_dMinElevation) is directly countable
+			// via reason="below elevation floor" instead of inferred from an
+			// aggregate rejection count.
 			CTSiDebugTrace::LogFmtAlways(
-				"_GetDBFSatellite: candidate SatId=%lu REJECTED hr=0x%08lX",
-				ulSat, (unsigned long)hr);
+				"_GetDBFSatellite: candidate SatId=%lu REJECTED hr=0x%08lX reason=%s",
+				ulSat, (unsigned long)hr, pszRejectReason);
 		}
 	}
 
 	// Reestabish initial values
 	pRawLpCalibObj->Set(pInitialLpCalibObj);  //Smruti - 3rd NOV
 
+	// Ambiguity/hysteresis resolution: the sweep above picks whichever
+	// candidate has the smallest FOA residual with no regard for how much
+	// better it is than the runner-up. When the top two are within
+	// c_dFoaAmbiguityMarginHz of each other, treat this as genuinely
+	// ambiguous - noise on this one sample could easily have picked the
+	// other one. Prefer staying with the beam's already-locked satellite if
+	// it's still in contention; otherwise reject the detection outright
+	// rather than risk crediting the wrong satellite's orbit with this
+	// beacon's residual (see the 2026-07-27/28 200kHz/1s buffer captures,
+	// which show exactly this - the same beacon's detections genuinely
+	// flip-flopping between two satellite IDs, including several at the
+	// same timestamp).
+	ULONG  ulFinalSatellite  = ulBestSatellite;
+	double dFinalFoaResidual = dMinFoaResidual;
+	double dFinalToaResidual = dMinToaResidual;
+	bool   bAmbiguousReject  = false;
 
-	if( fabs(dMinFoaResidual) < c_dMinFoaResidual ) 
+	bool bTooClose = (ulBestSatellite2 != ulBestSatellite) &&
+	                  (fabs(dMinFoaResidual2 - dMinFoaResidual) < c_dFoaAmbiguityMarginHz);
+
+	if( bTooClose )
+	{
+		if( bIncumbentEvaluated && (fabs(dIncumbentFoaResidual - dMinFoaResidual) < c_dFoaAmbiguityMarginHz) )
+		{
+			ulFinalSatellite  = ulIncumbentSatellite;
+			dFinalFoaResidual = dIncumbentFoaResidual;
+			dFinalToaResidual = dIncumbentToaResidual;
+
+			CTSiDebugTrace::LogFmtAlways(
+				"_GetDBFSatellite: HYSTERESIS BcnId=%016I64X AntId=%u - top two candidates "
+				"SatId=%lu (%.3f Hz) and SatId=%lu (%.3f Hz) are within %.1f Hz of each other; "
+				"staying with already-locked SatId=%lu (%.3f Hz) instead of switching",
+				pRawLpCalibObj->GetBcnId(), (unsigned)wAntID,
+				ulBestSatellite, dMinFoaResidual, ulBestSatellite2, dMinFoaResidual2,
+				c_dFoaAmbiguityMarginHz, ulIncumbentSatellite, dIncumbentFoaResidual);
+		}
+		else
+		{
+			bAmbiguousReject = true;
+
+			CTSiDebugTrace::LogFmtAlways(
+				"_GetDBFSatellite: AMBIGUOUS BcnId=%016I64X AntId=%u - top two candidates "
+				"SatId=%lu (%.3f Hz) and SatId=%lu (%.3f Hz) are within %.1f Hz of each other "
+				"with no usable incumbent to fall back on - rejecting detection rather than guess",
+				pRawLpCalibObj->GetBcnId(), (unsigned)wAntID,
+				ulBestSatellite, dMinFoaResidual, ulBestSatellite2, dMinFoaResidual2,
+				c_dFoaAmbiguityMarginHz);
+		}
+	}
+
+	if( !bAmbiguousReject && (fabs(dFinalFoaResidual) < c_dMinFoaResidual) )
 	{
 		hr = EMS_OK;
-		pRawLpCalibObj->SetSatId(ulBestSatellite);
+		pRawLpCalibObj->SetSatId(ulFinalSatellite);
 		bool bUpdateBeamArray = false;
 
 		if( dCNR > c_dDefaultCNRFilterThreshold )
 		{
-			if(m_ulArrBeamId[ulBeamID] != ulBestSatellite)
+			if(m_ulArrBeamId[ulBeamID] != ulFinalSatellite)
 			{
 				bUpdateBeamArray = true;
-				m_ulArrBeamId[ulBeamID] = ulBestSatellite;
+				m_ulArrBeamId[ulBeamID] = ulFinalSatellite;
 			}
 
 		}
@@ -1749,13 +1856,23 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 		hr = EMS_FALSE;
 	}
 
-	// Overall accept/reject decision for this detection: EMS_OK if the winning
-	// candidate's FOA residual beat c_dMinFoaResidual (5.0 Hz), EMS_FALSE
+	// Overall accept/reject decision for this detection: EMS_OK if the final
+	// satellite's FOA residual beat c_dMinFoaResidual (200.0 Hz - see
+	// definition) and it wasn't rejected as ambiguous above, EMS_FALSE
 	// otherwise. Same frequency as "REF BEACON HIT" since this only runs when
 	// lpRefBeaconData is set, so this stays low-volume.
+	//
+	// RunnerUp/Margin are logged unconditionally (not just when AMBIGUOUS or
+	// HYSTERESIS fires) so c_dFoaAmbiguityMarginHz can actually be tuned from
+	// data: without this, every detection that *doesn't* trigger the margin
+	// check is a blind spot - there's no way to tell "no candidates were ever
+	// close" from "candidates were close but just outside the margin".
+	double dRawMargin = fabs(dMinFoaResidual2 - dMinFoaResidual);
 	CTSiDebugTrace::LogFmtAlways(
-		"_GetDBFSatellite: RESULT hr=0x%08lX BestSatId=%lu dMinFoaResidual=%.3f dMinToaResidual=%.6f",
-		(unsigned long)hr, ulBestSatellite, dMinFoaResidual, dMinToaResidual);
+		"_GetDBFSatellite: RESULT hr=0x%08lX BestSatId=%lu dMinFoaResidual=%.3f dMinToaResidual=%.6f "
+		"RunnerUpSatId=%lu RunnerUpFoaResidual=%.3f Margin=%.3f",
+		(unsigned long)hr, ulFinalSatellite, dFinalFoaResidual, dFinalToaResidual,
+		ulBestSatellite2, dMinFoaResidual2, dRawMargin);
 
 	//if ( m_lpTraceSatFile )
 	{

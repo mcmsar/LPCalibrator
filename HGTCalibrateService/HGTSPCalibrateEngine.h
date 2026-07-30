@@ -75,8 +75,8 @@ class CHGTSPCalibrateEngine : public CEMSThread
 		void _PopulateRawSpCalibObjList( CEMSPointerList<CEMSRawSpCalibObj>&  lstCalibObj );
 		void _AddToCrossChannelBuffer( CEMSPointerList<CEMSRawSpCalibObj>&  lstNewCalibObj );
 		void _ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawSpCalibObj>&  lstReadyCalibObj );
-		void _RecordDispatch( ULONG ulLutId, ULONG ulSatId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency );
-		bool _IsLateArrivalDuplicate( ULONG ulLutId, ULONG ulSatId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency );
+		void _RecordDispatch( ULONG ulLutId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency );
+		bool _IsLateArrivalDuplicate( ULONG ulLutId, INT64 i64BcnId, INT64 i64ReceiveTimeNanos, double dFrequency );
 		void _PurgeRecentDispatchHistory();
 		void _PopulateChannelCalibObj( CEMSRawSpCalibObj*  pCalibObj );
 		void _PerformSpCalibration();
@@ -116,7 +116,6 @@ class CHGTSPCalibrateEngine : public CEMSThread
 		struct _RecentDispatch
 		{
 			ULONG   ulLutId;
-			ULONG   ulSatId;
 			INT64   i64BcnId;
 			INT64   i64ReceiveTimeNanos;
 			double  dFrequency;

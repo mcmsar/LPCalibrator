@@ -27,12 +27,30 @@
 #include "CBcnMsgDecodeBase.h"
 #include "CBeaconID.h"
 #include "TSiDebugTrace.h"
+#include "HGTCalibrationObjectsContainer.h"
 
 #include <sstream>
+#include <stdlib.h>
 
 const ULONG CHGTLPCalibOutput::ms_culTimeout = 100;		// 100 millisecs
 const ULONG CHGTLPCalibOutput::ms_culsleepTime = 200; //in milli seconds
-const ULONG CHGTLPCalibOutput::ms_culMaxRetries = 10; 
+const ULONG CHGTLPCalibOutput::ms_culMaxRetries = 10;
+
+bool   CHGTLPCalibOutput::ms_bFoaThresholdOverrideEnabled = false;
+double CHGTLPCalibOutput::ms_dFoaThresholdOverride = 0.0;
+
+// Fallback FOA-residual gate used only when no per-antenna calibration
+// parameters can be found for a record (see _OutputRawLPCalibData). Matches
+// the container's own default dFoaThreshold (HGTCalibrationObjectsContainer.cpp)
+// so behavior is unchanged for antennas with no lscalibdata.csv entry yet.
+static const double c_dDefaultFoaOutputThresholdHz = 10.0;
+
+// Test-only marker file for _LoadFoaThresholdOverride. Deliberately not next
+// to lscalibdata.csv - that file is rewritten wholesale by SaveSarrData on a
+// timer, so any value hand-edited there gets overwritten within a couple of
+// minutes by whatever the service already has in memory. This file is only
+// ever read once, at Start(), so it's immune to that.
+static const char c_szFoaThresholdOverridePath[] = "C:\\TSiDebugTrace.txt.foathreshold";
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -190,6 +208,8 @@ CHGTLPCalibOutput::Start()
 	CTSiDebugTrace::Log("LPCalibOutput::Start: entry");
 	EMS_RESULT hr = EMS_OK;
 
+	_LoadFoaThresholdOverride();
+
 	hr = _CreateObjects();
 	CTSiDebugTrace::LogHR("LPCalibOutput::Start: _CreateObjects", hr);
 
@@ -200,6 +220,48 @@ CHGTLPCalibOutput::Start()
 	}
 
 	return hr;
+}
+
+// See c_szFoaThresholdOverridePath. Format: the file's contents are a single
+// number, e.g. "150" or "150.0", read with the marker's mere presence (not
+// its content) governing the debug-log toggle already used elsewhere -
+// here the *value* matters, so a malformed/empty file is treated the same
+// as a missing one (override left disabled) rather than guessed at.
+void
+CHGTLPCalibOutput::_LoadFoaThresholdOverride()
+{
+	ms_bFoaThresholdOverrideEnabled = false;
+	ms_dFoaThresholdOverride = 0.0;
+
+	FILE* lpFile = fopen(c_szFoaThresholdOverridePath, "r");
+	if( !lpFile )
+		return;
+
+	char szBuf[64] = "";
+	fgets(szBuf, sizeof(szBuf) - 1, lpFile);
+	fclose(lpFile);
+
+	char* pEnd = NULL;
+	double dValue = strtod(szBuf, &pEnd);
+
+	if( (pEnd != szBuf) && (dValue > 0.0) )
+	{
+		ms_bFoaThresholdOverrideEnabled = true;
+		ms_dFoaThresholdOverride = dValue;
+
+		CTSiDebugTrace::LogFmtAlways(
+			"LP OUTPUT: FOA threshold override ACTIVE - using %.3f Hz for every "
+			"record instead of each antenna's configured lscalibdata.csv value "
+			"(from %s - delete and restart to disable)",
+			dValue, c_szFoaThresholdOverridePath);
+	}
+	else
+	{
+		CTSiDebugTrace::LogFmtAlways(
+			"LP OUTPUT: %s exists but did not contain a usable positive number "
+			"(\"%s\") - override left disabled",
+			c_szFoaThresholdOverridePath, szBuf);
+	}
 }
 
 void 
@@ -305,8 +367,43 @@ CHGTLPCalibOutput::_OutputRawLPCalibData(CEMSPointerList<CEMSRawLpCalibObj>& ols
 					double dFreqRes = pCal->GetResidualFrequency();
 					WORD wType = pCal->GetType();
 
-					if (fabs(dFreqRes)<10.0)
+					// The residual is only ever non-zero for reference-beacon records
+					// (see CHGTCalibrationObj::CalibrateSpRawObject - _ComputeResidual
+					// runs only when a ref beacon was matched); ordinary passes always
+					// clear this gate. Use the antenna's own configured FOA threshold
+					// (lscalibdata.csv "FOA Threshold (Hz)") rather than a fixed value,
+					// so this gate tracks whatever the site has actually been tuned to
+					// accept instead of silently rejecting everything once true bias
+					// drifts past a hardcoded number.
+					double dFoaOutputThreshold;
+					if( ms_bFoaThresholdOverrideEnabled )
+					{
+						dFoaOutputThreshold = ms_dFoaThresholdOverride;
+					}
+					else
+					{
+						HGTLSCALIBDATA lsCalibData = HGTLSCALIBDATA();
+						lsCalibData.dFoaThreshold = c_dDefaultFoaOutputThresholdHz;
+						CHGTCalibrationObjectsContainer::instance()->GetCalibrationParameters(
+							pCal->GetLutId(), pCal->GetAntennaId(), pCal->GetSatId(), &lsCalibData);
+						dFoaOutputThreshold = lsCalibData.dFoaThreshold;
+					}
+
+					if (fabs(dFreqRes) < dFoaOutputThreshold)
+					{
 						hr = _SendLPCalibDataToPipeline(pCal);
+					}
+					else
+					{
+						// Always-logged: this record is otherwise dropped with zero trace,
+						// which made "reference beacons aren't showing up in LP Calibration"
+						// unanswerable from the log alone.
+						CTSiDebugTrace::LogFmtAlways(
+							"LP OUTPUT: DROPPED BcnId=%016I64X LutId=%lu AntId=%u SatId=%lu "
+							"FreqResidual=%.3f threshold=%.3f",
+							pCal->GetBcnId(), pCal->GetLutId(), (unsigned)pCal->GetAntennaId(),
+							pCal->GetSatId(), dFreqRes, dFoaOutputThreshold);
+					}
 
 					switch ( hr )
 					{

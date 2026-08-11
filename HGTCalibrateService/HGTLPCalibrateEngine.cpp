@@ -27,6 +27,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <algorithm>
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -48,8 +49,23 @@ const ULONG CHGTLPCalibrateEngine::ms_culTimeout = 100;		// 100 millisecs
 // (missed duplicates) against false-positive risk (distinct beacons wrongly
 // merged).
 static const INT64  c_i64CrossChannelBufferNanos                = 30000000000;  // 30 s hold window
-static const INT64  c_i64CrossChannelReceiveTimeToleranceNanos  = 2000000;       // 2 ms leeway
-static const double c_dCrossChannelFrequencyToleranceHz         = 5.0;           // 5 Hz leeway
+
+// The duplicate rule: two detections are the same detection when they share
+// a LutId and a BeaconID, their receive times are within 0.5 s of each other,
+// and their frequencies are within 2 Hz of each other.
+//
+// Note these are NOT the same quantity as the hold window above. The hold
+// window is wall-clock time a record spends waiting in the buffer for a
+// partner to show up; the tolerances below compare the detections' own
+// reported receive time and frequency against each other. Conflating the
+// two is what previously left this test running at 2 ms / 5 Hz and missing
+// most real duplicates.
+//
+// Kept identical to the SP-side values in HGTSPCalibrateEngine.cpp - SP
+// dedups first and feeds LP, so a wider window here would only ever re-judge
+// SP's decisions by a different rule.
+static const INT64  c_i64DuplicateReceiveTimeToleranceNanos     = 500000000;    // 0.5 s
+static const double c_dDuplicateFrequencyToleranceHz            = 2.0;          // 2 Hz
 
 // A duplicate whose two copies reach the engine more than the 30s hold window
 // apart (e.g. one took a slower path upstream) would otherwise be missed
@@ -78,23 +94,46 @@ namespace
 		EMSTIME timeStored;
 	};
 
-	size_t _UfFind( std::vector<size_t>& vecParent, size_t x )
+	// The duplicate rule in one place, so the live-buffer pass and the
+	// late-arrival lookback can never drift apart.
+	bool _IsDuplicatePair( ULONG ulLutIdA, INT64 i64BcnIdA, INT64 i64RxA, double dFreqA,
+	                       ULONG ulLutIdB, INT64 i64BcnIdB, INT64 i64RxB, double dFreqB )
 	{
-		while( vecParent[x] != x )
-		{
-			vecParent[x] = vecParent[ vecParent[x] ];
-			x = vecParent[x];
-		}
-		return x;
+		if( ulLutIdA != ulLutIdB || i64BcnIdA != i64BcnIdB )
+			return false;
+
+		INT64 i64TimeDiff = i64RxA - i64RxB;
+		if( i64TimeDiff < 0 )
+			i64TimeDiff = -i64TimeDiff;
+
+		double dFreqDiff = dFreqA - dFreqB;
+		if( dFreqDiff < 0.0 )
+			dFreqDiff = -dFreqDiff;
+
+		return ( i64TimeDiff <= c_i64DuplicateReceiveTimeToleranceNanos &&
+		         dFreqDiff  <= c_dDuplicateFrequencyToleranceHz );
 	}
 
-	void _UfUnion( std::vector<size_t>& vecParent, size_t a, size_t b )
+	bool _IsDuplicatePair( const _LpDupCandidate& a, const _LpDupCandidate& b )
 	{
-		size_t ra = _UfFind( vecParent, a );
-		size_t rb = _UfFind( vecParent, b );
-		if( ra != rb )
-			vecParent[ra] = rb;
+		return _IsDuplicatePair( a.ulLutId, a.i64BcnId, a.i64ReceiveTimeNanos, a.dFrequency,
+		                         b.ulLutId, b.i64BcnId, b.i64ReceiveTimeNanos, b.dFrequency );
 	}
+
+	// Orders candidate indices oldest-received first, so clustering grows
+	// forward in time and doesn't depend on the order records happened to
+	// land in the hold buffer.
+	struct _ByReceiveTime
+	{
+		const std::vector<_LpDupCandidate>* pVec;
+
+		_ByReceiveTime( const std::vector<_LpDupCandidate>& vec ) : pVec( &vec ) {}
+
+		bool operator()( size_t a, size_t b ) const
+		{
+			return (*pVec)[a].i64ReceiveTimeNanos < (*pVec)[b].i64ReceiveTimeNanos;
+		}
+	};
 }
 
 
@@ -342,7 +381,7 @@ CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCali
 		// beacon ID) are still guarded against by the receive-time/frequency
 		// tolerances below - different satellites impart different Doppler
 		// shifts on the same 406 MHz beacon, so their raw frequencies
-		// generally differ by far more than the 5 Hz tolerance.
+		// generally differ by far more than the 2 Hz tolerance.
 		std::map<std::string, std::vector<size_t> > mapGroups;
 		char szKey[128];
 		for( size_t i = 0; i < vecCandidates.size(); i++ )
@@ -351,52 +390,70 @@ CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCali
 			mapGroups[ std::string(szKey) ].push_back( i );
 		}
 
-		// Union-find over candidate indices, so chains of near-identical
-		// detections (A close to B, B close to C) collapse into one cluster
-		// instead of being resolved as inconsistent pairwise decisions.
-		std::vector<size_t> vecParent( vecCandidates.size() );
-		for( size_t i = 0; i < vecParent.size(); i++ )
-			vecParent[i] = i;
+		// Cluster the candidates inside each group. A candidate joins an
+		// existing cluster only if it is a duplicate of EVERY member already
+		// in it (complete linkage), so every pair inside a cluster genuinely
+		// satisfies the rule.
+		//
+		// Deliberately not a transitive/union-find merge: chaining A-B and
+		// B-C would put A and C in one cluster even when they are two
+		// tolerance-widths apart and so not duplicates of each other, and a
+		// long enough chain could swallow genuinely distinct bursts of the
+		// same beacon and throw away real detections. Complete linkage keeps
+		// that impossible regardless of how the tolerances are later tuned.
+		std::vector<size_t> vecClusterId( vecCandidates.size(), 0 );
+		std::vector< std::vector<size_t> > vecClusterMembers;
 
 		for( std::map<std::string, std::vector<size_t> >::iterator itGroup = mapGroups.begin(); itGroup != mapGroups.end(); ++itGroup )
 		{
 			std::vector<size_t>& vecIdx = itGroup->second;
-			if( vecIdx.size() < 2 )
-				continue;
+
+			std::sort( vecIdx.begin(), vecIdx.end(), _ByReceiveTime( vecCandidates ) );
+
+			std::vector<size_t> vecGroupClusters;   // cluster ids opened for this group
 
 			for( size_t a = 0; a < vecIdx.size(); a++ )
 			{
-				for( size_t b = a + 1; b < vecIdx.size(); b++ )
+				const size_t idx = vecIdx[a];
+				bool bPlaced = false;
+
+				for( size_t c = 0; c < vecGroupClusters.size() && !bPlaced; c++ )
 				{
-					const _LpDupCandidate& ca = vecCandidates[ vecIdx[a] ];
-					const _LpDupCandidate& cb = vecCandidates[ vecIdx[b] ];
+					std::vector<size_t>& vecMembers = vecClusterMembers[ vecGroupClusters[c] ];
 
-					INT64 i64TimeDiff = ca.i64ReceiveTimeNanos - cb.i64ReceiveTimeNanos;
-					if( i64TimeDiff < 0 )
-						i64TimeDiff = -i64TimeDiff;
-
-					double dFreqDiff = ca.dFrequency - cb.dFrequency;
-					if( dFreqDiff < 0.0 )
-						dFreqDiff = -dFreqDiff;
-
-					if( i64TimeDiff <= c_i64CrossChannelReceiveTimeToleranceNanos &&
-						dFreqDiff  <= c_dCrossChannelFrequencyToleranceHz )
+					bool bMatchesAll = true;
+					for( size_t m = 0; m < vecMembers.size() && bMatchesAll; m++ )
 					{
-						_UfUnion( vecParent, vecIdx[a], vecIdx[b] );
+						if( !_IsDuplicatePair( vecCandidates[idx], vecCandidates[ vecMembers[m] ] ) )
+							bMatchesAll = false;
 					}
+
+					if( bMatchesAll )
+					{
+						vecClusterId[idx] = vecGroupClusters[c];
+						vecMembers.push_back( idx );
+						bPlaced = true;
+					}
+				}
+
+				if( !bPlaced )
+				{
+					vecClusterId[idx] = vecClusterMembers.size();
+					vecGroupClusters.push_back( vecClusterMembers.size() );
+					vecClusterMembers.push_back( std::vector<size_t>( 1, idx ) );
 				}
 			}
 		}
 
 		// Best (highest-CNR) candidate per cluster.
-		std::map<size_t, size_t> mapBestInCluster; // root index -> best index
+		std::map<size_t, size_t> mapBestInCluster; // cluster id -> best index
 		for( size_t i = 0; i < vecCandidates.size(); i++ )
 		{
-			size_t root = _UfFind( vecParent, i );
-			std::map<size_t, size_t>::iterator itBest = mapBestInCluster.find( root );
+			size_t cluster = vecClusterId[i];
+			std::map<size_t, size_t>::iterator itBest = mapBestInCluster.find( cluster );
 			if( itBest == mapBestInCluster.end() )
 			{
-				mapBestInCluster[root] = i;
+				mapBestInCluster[cluster] = i;
 			}
 			else if( vecCandidates[i].dCarrierPower > vecCandidates[ itBest->second ].dCarrierPower )
 			{
@@ -415,7 +472,7 @@ CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCali
 		{
 			INT64 i64AgeNanos = timeNow.intTime - vecCandidates[i].timeStored.intTime;
 			if( i64AgeNanos >= c_i64CrossChannelBufferNanos )
-				setClustersReady.insert( _UfFind( vecParent, i ) );
+				setClustersReady.insert( vecClusterId[i] );
 		}
 
 		if( setClustersReady.empty() )
@@ -429,11 +486,11 @@ CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCali
 
 		for( size_t i = 0; i < vecCandidates.size(); i++ )
 		{
-			size_t root = _UfFind( vecParent, i );
-			if( setClustersReady.find( root ) == setClustersReady.end() )
+			size_t cluster = vecClusterId[i];
+			if( setClustersReady.find( cluster ) == setClustersReady.end() )
 				continue; // this cluster hasn't reached its 30s window yet
 
-			size_t best = mapBestInCluster[root];
+			size_t best = mapBestInCluster[cluster];
 			if( i == best )
 			{
 				// Before treating this as a fresh detection, check it isn't a
@@ -460,12 +517,15 @@ CHGTLPCalibrateEngine::_ResolveCrossChannelBuffer( CEMSPointerList<CEMSRawLpCali
 			{
 				setToDrop.insert( vecCandidates[i].pObj );
 
+				INT64 i64TimeDelta = vecCandidates[i].i64ReceiveTimeNanos - vecCandidates[best].i64ReceiveTimeNanos;
+
 				CTSiDebugTrace::LogFmtAlways(
 					"LP CROSS-CHANNEL DUP: dropping BcnId=%016I64X LutId=%lu AntId=%u Freq=%.3f CNR=%.2f "
-					"(kept AntId=%u Freq=%.3f CNR=%.2f)",
+					"(kept AntId=%u Freq=%.3f CNR=%.2f; dT=%.3fs dF=%.3fHz)",
 					vecCandidates[i].i64BcnId, vecCandidates[i].ulLutId,
 					(unsigned)vecCandidates[i].wAntId, vecCandidates[i].dFrequency, vecCandidates[i].dCarrierPower,
-					(unsigned)vecCandidates[best].wAntId, vecCandidates[best].dFrequency, vecCandidates[best].dCarrierPower );
+					(unsigned)vecCandidates[best].wAntId, vecCandidates[best].dFrequency, vecCandidates[best].dCarrierPower,
+					(double)i64TimeDelta * 1e-9, vecCandidates[i].dFrequency - vecCandidates[best].dFrequency );
 			}
 		}
 
@@ -520,19 +580,8 @@ CHGTLPCalibrateEngine::_IsLateArrivalDuplicate( ULONG ulLutId, INT64 i64BcnId, I
 	{
 		const _RecentDispatch& hist = m_vecRecentDispatchHistory[i];
 
-		if( hist.ulLutId != ulLutId || hist.i64BcnId != i64BcnId )
-			continue;
-
-		INT64 i64TimeDiff = i64ReceiveTimeNanos - hist.i64ReceiveTimeNanos;
-		if( i64TimeDiff < 0 )
-			i64TimeDiff = -i64TimeDiff;
-
-		double dFreqDiff = dFrequency - hist.dFrequency;
-		if( dFreqDiff < 0.0 )
-			dFreqDiff = -dFreqDiff;
-
-		if( i64TimeDiff <= c_i64CrossChannelReceiveTimeToleranceNanos &&
-			dFreqDiff  <= c_dCrossChannelFrequencyToleranceHz )
+		if( _IsDuplicatePair( ulLutId, i64BcnId, i64ReceiveTimeNanos, dFrequency,
+		                      hist.ulLutId, hist.i64BcnId, hist.i64ReceiveTimeNanos, hist.dFrequency ) )
 		{
 			return true;
 		}

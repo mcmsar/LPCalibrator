@@ -26,6 +26,7 @@
 #include "HGTCalibrationObjectsContainer.h"
 #include "HGTFileLogger.h"
 #include "TSiDebugTrace.h"
+#include "DBFPlateConfig.h"
 
 const TCHAR c_szServiceName[] 		= TEXT("EMSLS600Calib406");
 const ULONG c_ulTimeoutInterval		= 100; 			// i.e. every 100 ms.
@@ -242,6 +243,12 @@ EMS_RESULT CHGTCalibrateService::_Initialize( void )
 		m_oLPCalibrateEngine.InitRefBcns(m_lpRefBeaconData, m_lRefBeaconCount);
 		CTSiDebugTrace::Log("_Initialize: LPCalibrateEngine.InitRefBcns done");
 	}
+
+	// Plate face orientation, for the field-of-view test in _GetDBFSatellite.
+	// Loaded before the calibration objects so the very first detection already
+	// has it; failure is non-fatal and simply leaves the test disabled.
+	CTSiDebugTrace::Log("_Initialize: loading DBF plate configuration");
+	CDBFPlateConfig::instance()->Load();
 
 	CTSiDebugTrace::Log("_Initialize: calling CalibrationObjectsContainer::Initialize (loads lscalibdata.csv)");
 	hr = CHGTCalibrationObjectsContainer::instance()->Initialize();

@@ -235,7 +235,21 @@ CHGTLPCalibOutput::_LoadFoaThresholdOverride()
 
 	FILE* lpFile = fopen(c_szFoaThresholdOverridePath, "r");
 	if( !lpFile )
+	{
+		// Logged, and logged with the full path, because the two failure modes
+		// that matter here are indistinguishable otherwise: "no override was
+		// intended" and "an override was intended but the file is somewhere
+		// else, or spelled differently". This path was previously silent, which
+		// cost three days of the output gate quietly staying on the
+		// lscalibdata.csv value while a misnamed override file
+		// (...foathreshhold, doubled h) sat next to it. Printing the exact
+		// string being opened makes that a one-line diagnosis.
+		CTSiDebugTrace::LogFmtAlways(
+			"LP OUTPUT: no FOA threshold override - '%s' not found; using each "
+			"antenna's configured lscalibdata.csv FOA Threshold instead",
+			c_szFoaThresholdOverridePath);
 		return;
+	}
 
 	char szBuf[64] = "";
 	fgets(szBuf, sizeof(szBuf) - 1, lpFile);

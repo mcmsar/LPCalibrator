@@ -37,6 +37,7 @@
 #include "convutility.h"
 #include "HGTFileLogger.h"
 #include "TSiDebugTrace.h"
+#include "DBFPlateConfig.h"
 
 //#include <math.h>
 //#include "emsvectr.h"
@@ -76,6 +77,27 @@ const double c_dSAthreshold  = 7.0; // Minimum allowed satellite separation angl
 // including several at the exact same timestamp. Starting value is a guess;
 // tune from the "AMBIGUOUS"/"HYSTERESIS" trace lines this produces.
 const double c_dFoaAmbiguityMarginHz = 20.0;
+
+// A candidate satellite must get the arrival TIME this close before it is
+// allowed to compete on frequency residual. Tightened from 0.02 (which the
+// commented-out 0.005 above it suggests was already suspected of being loose).
+//
+// 0.02 s is ~6000 km of range error - so wide it discriminates nothing. In the
+// 2026-08-05 capture, satellite 433 was selected for two populations that split
+// cleanly by beacon: the correctly-identified one had a median |TOA residual|
+// of 0.18 ms, the misidentified one 8.8 ms - a 50x separation that 0.02 s let
+// straight through, admitting detections with 6.5 kHz frequency residuals.
+// 0.002 s (~600 km) sits in the gap between the two populations.
+const double c_dMaxToaResidualSec = 0.002;
+
+// Above this, a reference-beacon FOA residual is treated as evidence that the
+// detection was attributed to the wrong satellite, and it is excluded from the
+// bias update entirely rather than clamped into it. See _CalculateOffsets.
+// Sits well above the largest genuine bias error observed (the ~1478 Hz
+// accumulated in lscalibdata.csv was itself the product of a broken loop, and
+// real per-detection residuals now run at ~0.3 Hz) and well below the 4-10 kHz
+// misidentification population.
+const double c_dMaxBiasUpdateResidualHz = 1000.0;
 
 CHGTCalibrationObj::CHGTCalibrationObj() :  CApiObjBase( TEXT("CHGTCalibrationObj") ),m_lpOrbit(NULL)
 											
@@ -1262,35 +1284,65 @@ CHGTCalibrationObj::_CalculateOffsets( CEMSRawLpCalibObj* pRawLpCalibObj )
 
 				dAlphaFreq = m_lsCalibData.dFoaGain;
 
-				// Check if alarm condition or initialization
-				//if ( !bTimeOK || !bStatusOK || (m_lsCalibData.ulFoaCount < c_ulConvergenceTestCount ) )
-				//{
-					//dAlphaFreq = 1.0;
-				//}
-
-				// Threshold test
-				//if(m_lsCalibData.ulFoaCount > c_ulConvergenceTestCount )
+				// Plausibility bound, applied BEFORE the threshold clamp below.
+				//
+				// The clamp limits how far one detection can move the bias, but it
+				// does not question whether the detection should move it at all -
+				// it turns any outlier into a full-magnitude push, and a
+				// systematically misidentified satellite then walks the bias
+				// steadily in one direction. A residual of this size is not
+				// evidence that the stored bias drifted; it is evidence that this
+				// detection belongs to a different satellite.
+				//
+				// In the 2026-08-06 capture, 30 accepted detections carried
+				// residuals of 4-10 kHz (sat 408 clustered at -9999.4..-9999.97,
+				// sat 403 at -7300..-8588, sat 436 at -4036..-4173). All were
+				// discarded downstream by the LP output threshold, but each would
+				// have contributed a clamped 10 Hz push here first - roughly 300 Hz
+				// against a signal whose median residual is now 0.3 Hz.
+				if ( fabs(dFreqDiff) >= c_dMaxBiasUpdateResidualHz )
 				{
-					if ( dFreqDiff >  m_lsCalibData.dFoaThreshold ) dFreqDiff =  m_lsCalibData.dFoaThreshold;
-					if ( dFreqDiff < -m_lsCalibData.dFoaThreshold ) dFreqDiff = -m_lsCalibData.dFoaThreshold;
+					CTSiDebugTrace::LogFmtAlways(
+						"SP BIAS SKIPPED FOA: LutId=%lu AntId=%u Const=%lu freqDiff=%.3f "
+						"exceeds plausibility bound %.1f Hz - treating as misidentification, "
+						"not bias drift; bias left at %.6f count=%lu",
+						m_lsCalibData.ulLutId, (unsigned)m_lsCalibData.wAntId,
+						m_lsCalibData.ulConstellation, dFreqDiff,
+						c_dMaxBiasUpdateResidualHz,
+						m_lsCalibData.dFoaBias, m_lsCalibData.ulFoaCount);
 				}
+				else
+				{
+					// Check if alarm condition or initialization
+					//if ( !bTimeOK || !bStatusOK || (m_lsCalibData.ulFoaCount < c_ulConvergenceTestCount ) )
+					//{
+						//dAlphaFreq = 1.0;
+					//}
 
-				m_lsCalibData.dFoaBias += dAlphaFreq * dFreqDiff;
-				m_lsCalibData.timeLastUpdate = pRawLpCalibObj->GetTimeMsg();
+					// Threshold test
+					//if(m_lsCalibData.ulFoaCount > c_ulConvergenceTestCount )
+					{
+						if ( dFreqDiff >  m_lsCalibData.dFoaThreshold ) dFreqDiff =  m_lsCalibData.dFoaThreshold;
+						if ( dFreqDiff < -m_lsCalibData.dFoaThreshold ) dFreqDiff = -m_lsCalibData.dFoaThreshold;
+					}
 
-				//pRawLpCalibObj->SetFreqOffset(m_lsCalibData.dFoaBias);
+					m_lsCalibData.dFoaBias += dAlphaFreq * dFreqDiff;
+					m_lsCalibData.timeLastUpdate = pRawLpCalibObj->GetTimeMsg();
 
-				m_lsCalibData.ulFoaCount++;
+					//pRawLpCalibObj->SetFreqOffset(m_lsCalibData.dFoaBias);
 
-				CTSiDebugTrace::LogFmtAlways(
-					"SP BIAS UPDATE FOA: LutId=%lu AntId=%u Const=%lu "
-					"freqDiff=%.3f alpha=%.5f newFOABias=%.6f count=%lu",
-					m_lsCalibData.ulLutId, (unsigned)m_lsCalibData.wAntId,
-					m_lsCalibData.ulConstellation,
-					dFreqDiff, dAlphaFreq,
-					m_lsCalibData.dFoaBias, m_lsCalibData.ulFoaCount);
+					m_lsCalibData.ulFoaCount++;
 
-				hr = EMS_OK;
+					CTSiDebugTrace::LogFmtAlways(
+						"SP BIAS UPDATE FOA: LutId=%lu AntId=%u Const=%lu "
+						"freqDiff=%.3f alpha=%.5f newFOABias=%.6f count=%lu",
+						m_lsCalibData.ulLutId, (unsigned)m_lsCalibData.wAntId,
+						m_lsCalibData.ulConstellation,
+						dFreqDiff, dAlphaFreq,
+						m_lsCalibData.dFoaBias, m_lsCalibData.ulFoaCount);
+
+					hr = EMS_OK;
+				}
 			}
 
 			if ( EMS_C406PF_REF_TIME_FLAG & pRawLpCalibObj->GetProcessFlags() )
@@ -1610,6 +1662,7 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 	double dMinFoaResidual2 = 10000.0;
 	double dElevation = 0.0;
 	double dBestSatElevation = 0.0;
+	double dBestSatAzimuth = 0.0;
 	double dDopplerUL = 0.0;
 	double dDopplerDL = 0.0;
 	double dFOAbias = 0.0;
@@ -1632,6 +1685,29 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 	bool   bIncumbentEvaluated   = false;
 	double dIncumbentFoaResidual = 0.0;
 	double dIncumbentToaResidual = 0.0;
+
+	// Best candidate by FOA residual alone, ignoring the |TOA| < 0.02 gate that
+	// the main selection below also requires. When no candidate clears that TOA
+	// gate, dMinFoaResidual stays at its 10000.0 sentinel and ulBestSatellite
+	// stays at the incoming SatId, which used to mean an unconditional reject
+	// of the whole detection - 3184 of them in the 2026-07-29..08-04 capture,
+	// ~23% of every rejection. Falling back to this pair keeps such a detection
+	// usable for bias correction instead of discarding it outright.
+	ULONG  ulBestSatelliteFoaOnly  = ulFirstSatId;
+	double dBestFoaResidualFoaOnly = 0.0;
+	double dBestToaResidualFoaOnly = 0.0;
+	double dBestAzimuthFoaOnly     = 0.0;
+	double dBestElevationFoaOnly   = 0.0;
+	bool   bToaGatePassed          = false;
+
+	// Whether the winning candidate needed the 0.22 s bit-phase correction to
+	// clear the TOA gate. See the bit-phase guard in the accept/reject decision.
+	bool   bBestUsedBitPhase       = false;
+
+	// How many candidates actually produced a residual to judge. One means the
+	// "best" was never compared against anything - see the single-survivor guard
+	// in the accept/reject decision below.
+	ULONG  ulCandidatesEvaluated   = 0;
 
 
 	for(ULONG ulSat = ulMinSat; ulSat <= ulMaxSat ; ulSat++)
@@ -1660,10 +1736,29 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 			if( hr != EMS_OK )
 				pszRejectReason = "azimuth/elevation calc";
 			dElevation = pRawLpCalibObj->GetElevation();
-			if(dElevation < c_dMinElevation)
+
+			// Elevation floor. c_dMinElevation (10 deg) is the calibration code's
+			// own number and is unrelated to this plate; when a plate config is
+			// loaded its configured minimum is used instead, which matches the
+			// plate system and stops real low-elevation traffic being clipped.
+			const CDBFPlateConfig* pPlate = CDBFPlateConfig::instance();
+			double dMinElevation = pPlate->GetEffectiveMinElevation( c_dMinElevation );
+
+			if(dElevation < dMinElevation)
 			{
 				hr = EMS_FALSE;
 				pszRejectReason = "below elevation floor";
+			}
+			else if( !pPlate->IsWithinFieldOfView( pRawLpCalibObj->GetAzimuth() ) )
+			{
+				// The candidate is above the horizon but outside the azimuth sector
+				// the plate can actually see, so it cannot be the source of this
+				// detection - prune it from the sweep rather than letting it compete
+				// on FOA residual alone. Removing physically impossible candidates
+				// also takes pressure off the ambiguity check downstream, which then
+				// only has to arbitrate between satellites the plate could hear.
+				hr = EMS_FALSE;
+				pszRejectReason = "outside plate azimuth sector";
 			}
 		}
 
@@ -1713,15 +1808,45 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 				bIncumbentEvaluated = true;
 			}
 
+			// Reference-beacon bit-phase correction: the 24th bit is assumed to
+			// fall at the 220 ms mark, so a residual sitting near 0.22 s is read
+			// as bit-phase rather than range error. Note it only ever fires on the
+			// positive side.
+			//
+			// Remember when it fires. Once the TOA gate tightened to 2 ms this
+			// became the only way a grossly wrong candidate could still look
+			// on-time: subtracting 0.22 turns a 220 ms residual (~66000 km of
+			// range error) into ~0.0001 s, which clears the gate outright. In the
+			// 2026-08-06 capture all four surviving bad detections had exactly
+			// this signature - TOA 0.2192..0.2215 with FOA residuals of 1099 to
+			// 6005 Hz - while the four legitimate near-0.22 detections were on the
+			// negative side, never corrected, and carried FOA residuals under
+			// 100 Hz. The correction itself is the discriminator.
+			bool bBitPhaseApplied = false;
 			if ( (dTestTimeResidual > 0.2) &&  (dTestTimeResidual < 0.24) )
 			{
 				dTestTimeResidual -= 0.22;
+				bBitPhaseApplied = true;
 			}
 
+			// Tracked independently of the TOA gate below, so there is always a
+			// best-by-FOA candidate to fall back on. See the declaration.
+			if( (0 == ulCandidatesEvaluated) || (fabs(dTestFrqResidual) < fabs(dBestFoaResidualFoaOnly)) )
+			{
+				ulBestSatelliteFoaOnly  = ulSat;
+				dBestFoaResidualFoaOnly = dTestFrqResidual;
+				dBestToaResidualFoaOnly = pRawLpCalibObj->GetResidualTime();
+				dBestAzimuthFoaOnly     = pRawLpCalibObj->GetAzimuth();
+				dBestElevationFoaOnly   = dElevation;
+			}
+
+			ulCandidatesEvaluated++;
 
 			//if( (fabs(dTestFrqResidual) < fabs(dMinFoaResidual)) && (fabs(dTestTimeResidual) < 0.005 ) )
-			if( (fabs(dTestFrqResidual) < fabs(dMinFoaResidual)) && (fabs(dTestTimeResidual) < 0.02 ) )
+			if( (fabs(dTestFrqResidual) < fabs(dMinFoaResidual)) && (fabs(dTestTimeResidual) < c_dMaxToaResidualSec ) )
 			{
+				bToaGatePassed = true;
+				bBestUsedBitPhase = bBitPhaseApplied;
 				dMinFoaResidual2 = dMinFoaResidual;
 				ulBestSatellite2 = ulBestSatellite;
 				dMinFoaResidual = dTestFrqResidual;
@@ -1730,6 +1855,7 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 				dDopplerUL = m_dDopplerShiftUL;
 				dDopplerDL = m_dDopplerShiftDL;
 				dBestSatElevation = dElevation;
+				dBestSatAzimuth = pRawLpCalibObj->GetAzimuth();
 				site = m_lsCalibData.siteLocation;
 				dFOAbias = lsCalibData.dFoaBias;
 				dTOAbias = lsCalibData.dToaBias;
@@ -1784,6 +1910,36 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 	// Reestabish initial values
 	pRawLpCalibObj->Set(pInitialLpCalibObj);  //Smruti - 3rd NOV
 
+	// No candidate cleared the |TOA| < 0.02 gate, so the selection above never
+	// ran and its outputs are still at their sentinels. Use the best-by-FOA
+	// candidate rather than rejecting the detection: a poor TOA residual is a
+	// reason to distrust the *time* calibration, not a reason to throw away the
+	// frequency information as well - and _CalculateOffsets clamps whatever it
+	// receives to +/- the configured threshold before applying gain, so a bad
+	// value can only ever move the bias by threshold*gain.
+	bool bToaGateFellBack = false;
+	if( !bToaGatePassed && (ulCandidatesEvaluated > 0) )
+	{
+		bToaGateFellBack = true;
+		ulBestSatellite  = ulBestSatelliteFoaOnly;
+		dMinFoaResidual  = dBestFoaResidualFoaOnly;
+		dMinToaResidual  = dBestToaResidualFoaOnly;
+
+		// Also carry the geometry across. Without this, dBestSatAzimuth /
+		// dBestSatElevation stay at 0,0 on the fallback path and the AzOffset
+		// reported below is measured from due north at the horizon rather than
+		// from the satellite actually chosen - which made 194 of 815 RESULT
+		// lines in the 2026-08-05 capture look far off-sector when they were not.
+		dBestSatAzimuth   = dBestAzimuthFoaOnly;
+		dBestSatElevation = dBestElevationFoaOnly;
+
+		CTSiDebugTrace::LogFmtAlways(
+			"_GetDBFSatellite: TOA-GATE FALLBACK BcnId=%016I64X AntId=%u - no candidate had "
+			"|TOA residual| < 0.02s; using best-by-FOA SatId=%lu (%.3f Hz, TOA %.6f s)",
+			pRawLpCalibObj->GetBcnId(), (unsigned)wAntID,
+			ulBestSatelliteFoaOnly, dBestFoaResidualFoaOnly, dBestToaResidualFoaOnly);
+	}
+
 	// Ambiguity/hysteresis resolution: the sweep above picks whichever
 	// candidate has the smallest FOA residual with no regard for how much
 	// better it is than the runner-up. When the top two are within
@@ -1834,33 +1990,121 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 		}
 	}
 
-	if( !bAmbiguousReject && (fabs(dFinalFoaResidual) < c_dMinFoaResidual) )
+	// Accept/reject. An oversized FOA residual is deliberately NOT a rejection:
+	// a reference beacon detection whose residual exceeds c_dMinFoaResidual is
+	// exactly the case that most needs to reach _CalculateOffsets, because that
+	// is the evidence the stored bias has drifted. Rejecting it instead (the
+	// behaviour before this change) was self-sustaining - the gate is 200 Hz
+	// and the accumulated FOA biases in lscalibdata.csv had reached -134 to
+	// -1478 Hz, so every detection came back over the gate, was discarded, and
+	// the bias that caused the overshoot could never be corrected. In the
+	// 2026-07-29..08-04 capture that discarded 74.9% of all reference-beacon
+	// detections and froze every lscalibdata.csv row after 2026/211 18:01.
+	//
+	// _CalculateOffsets clamps the residual to +/- the configured threshold
+	// before applying gain, so an outlier can still only move the bias by
+	// threshold*gain (200 Hz * 0.05 = 10 Hz) per detection. That clamp, not
+	// this gate, is what bounds the damage from a bad residual.
+	//
+	// Genuine satellite ambiguity IS still a rejection: if the sweep cannot say
+	// which satellite this was, crediting the residual to a specific
+	// lscalibdata.csv row would corrupt whichever one it guessed.
+	//
+	// So is "no candidate survived the sweep at all" - every one was rejected on
+	// orbit update, elevation, or the plate azimuth sector, so not one produced a
+	// residual to judge. ulBestSatellite is then still the provisional incoming
+	// SatId and dMinFoaResidual still its 10000.0 sentinel; accepting that would
+	// wave an entirely unvetted detection through under a satellite ID nothing
+	// ever checked. The old code caught this by accident, because the sentinel
+	// failed the c_dMinFoaResidual test that used to gate acceptance - removing
+	// that gate means it now has to be caught deliberately.
+	// Single-survivor guard. Dropping the FOA gate above is safe only when the
+	// winner actually beat something: the sweep's confidence comes from having
+	// compared candidates, and the ambiguity check needs two of them to fire at
+	// all. With exactly one candidate evaluated, nothing was compared and nothing
+	// can be ambiguous, so an arbitrarily bad residual is accepted unopposed.
+	//
+	// That is precisely how satellite 433 was being credited with 6.5 kHz
+	// frequency residuals in the 2026-08-05 capture: over-tight geometric
+	// pruning left it as the only survivor in 16.6% of detections (up from 0.6%),
+	// and it then won by default. So when the winner is unopposed, require it to
+	// clear c_dMinFoaResidual after all - the gate is reinstated exactly where
+	// there is no corroboration, and stays off where there is.
+	bool bUnopposedReject = ( 1 == ulCandidatesEvaluated ) &&
+	                        ( fabs(dFinalFoaResidual) >= c_dMinFoaResidual );
+
+	// Bit-phase guard, same principle as the single-survivor guard above: where
+	// the TOA evidence is weaker, require the frequency to corroborate it. A
+	// winner that only cleared the TOA gate because 0.22 s was subtracted from
+	// its residual has not actually demonstrated a range match - the raw
+	// residual is still 220 ms - so it does not get the benefit of the dropped
+	// FOA gate. A genuine bit-phase case pairs the 0.22 s offset with a small
+	// frequency residual and still passes; a misidentified satellite pairs it
+	// with kHz and does not. Only applies when the bit-phase branch actually
+	// fired, so detections whose TOA is legitimately small are untouched.
+	bool bBitPhaseReject = bToaGatePassed && bBestUsedBitPhase && !bToaGateFellBack &&
+	                       ( fabs(dFinalFoaResidual) >= c_dMinFoaResidual );
+
+	if( bAmbiguousReject || bUnopposedReject || bBitPhaseReject || (0 == ulCandidatesEvaluated) )
 	{
-		hr = EMS_OK;
-		pRawLpCalibObj->SetSatId(ulFinalSatellite);
-		bool bUpdateBeamArray = false;
+		hr = EMS_FALSE;
 
-		if( dCNR > c_dDefaultCNRFilterThreshold )
+		if( 0 == ulCandidatesEvaluated )
 		{
-			if(m_ulArrBeamId[ulBeamID] != ulFinalSatellite)
-			{
-				bUpdateBeamArray = true;
-				m_ulArrBeamId[ulBeamID] = ulFinalSatellite;
-			}
-
+			CTSiDebugTrace::LogFmtAlways(
+				"_GetDBFSatellite: NO CANDIDATES BcnId=%016I64X AntId=%u - every satellite in "
+				"%lu..%lu was rejected before a residual could be computed; discarding detection",
+				pRawLpCalibObj->GetBcnId(), (unsigned)wAntID, ulMinSat, ulMaxSat);
 		}
-
+		else if( bUnopposedReject )
+		{
+			CTSiDebugTrace::LogFmtAlways(
+				"_GetDBFSatellite: UNOPPOSED BcnId=%016I64X AntId=%u - SatId=%lu was the only "
+				"candidate to survive the sweep and its FOA residual %.3f Hz exceeds %.1f Hz; "
+				"nothing corroborates it, so discarding rather than crediting it by default",
+				pRawLpCalibObj->GetBcnId(), (unsigned)wAntID, ulFinalSatellite,
+				dFinalFoaResidual, c_dMinFoaResidual);
+		}
+		else if( bBitPhaseReject )
+		{
+			CTSiDebugTrace::LogFmtAlways(
+				"_GetDBFSatellite: BIT-PHASE BcnId=%016I64X AntId=%u - SatId=%lu only cleared the "
+				"TOA gate after the 0.22s bit-phase correction (raw TOA residual %.6f s) and its "
+				"FOA residual %.3f Hz exceeds %.1f Hz; frequency does not corroborate the range, "
+				"so discarding",
+				pRawLpCalibObj->GetBcnId(), (unsigned)wAntID, ulFinalSatellite,
+				dFinalToaResidual, dFinalFoaResidual, c_dMinFoaResidual);
+		}
 	}
 	else
 	{
-		hr = EMS_FALSE;
+		hr = EMS_OK;
+		pRawLpCalibObj->SetSatId(ulFinalSatellite);
+
+		// Beam lock still requires a residual inside the gate (and adequate
+		// CNR). Which satellite a beam is tracking is a confidence judgement,
+		// and an out-of-gate residual is precisely when that judgement is least
+		// trustworthy - so an over-threshold detection updates the bias but is
+		// not allowed to re-point the beam's satellite association.
+		if( (fabs(dFinalFoaResidual) < c_dMinFoaResidual) && !bToaGateFellBack &&
+			(dCNR > c_dDefaultCNRFilterThreshold) )
+		{
+			if(m_ulArrBeamId[ulBeamID] != ulFinalSatellite)
+			{
+				m_ulArrBeamId[ulBeamID] = ulFinalSatellite;
+			}
+		}
 	}
 
-	// Overall accept/reject decision for this detection: EMS_OK if the final
-	// satellite's FOA residual beat c_dMinFoaResidual (200.0 Hz - see
-	// definition) and it wasn't rejected as ambiguous above, EMS_FALSE
-	// otherwise. Same frequency as "REF BEACON HIT" since this only runs when
-	// lpRefBeaconData is set, so this stays low-volume.
+	// Overall accept/reject decision for this detection: EMS_FALSE only when the
+	// satellite was genuinely ambiguous, EMS_OK otherwise. Same frequency as
+	// "REF BEACON HIT" since this only runs when lpRefBeaconData is set, so this
+	// stays low-volume.
+	//
+	// OverGate/ToaFallback are reported so the two cases that used to be silent
+	// rejections stay countable now that they are accepted - "how often is the
+	// bias being driven by an out-of-gate residual" is the number to watch while
+	// the stored biases converge back down.
 	//
 	// RunnerUp/Margin are logged unconditionally (not just when AMBIGUOUS or
 	// HYSTERESIS fires) so c_dFoaAmbiguityMarginHz can actually be tuned from
@@ -1870,9 +2114,15 @@ CHGTCalibrationObj::_GetDBFSatellite(CEMSRawLpCalibObj* pRawLpCalibObj, ULONG ul
 	double dRawMargin = fabs(dMinFoaResidual2 - dMinFoaResidual);
 	CTSiDebugTrace::LogFmtAlways(
 		"_GetDBFSatellite: RESULT hr=0x%08lX BestSatId=%lu dMinFoaResidual=%.3f dMinToaResidual=%.6f "
-		"RunnerUpSatId=%lu RunnerUpFoaResidual=%.3f Margin=%.3f",
+		"RunnerUpSatId=%lu RunnerUpFoaResidual=%.3f Margin=%.3f OverGate=%s ToaFallback=%s "
+		"BestAz=%.2f BestEl=%.2f AzOffset=%+.2f Candidates=%lu",
 		(unsigned long)hr, ulFinalSatellite, dFinalFoaResidual, dFinalToaResidual,
-		ulBestSatellite2, dMinFoaResidual2, dRawMargin);
+		ulBestSatellite2, dMinFoaResidual2, dRawMargin,
+		(fabs(dFinalFoaResidual) < c_dMinFoaResidual) ? "NO" : "YES",
+		bToaGateFellBack ? "YES" : "NO",
+		dBestSatAzimuth, dBestSatElevation,
+		CDBFPlateConfig::instance()->AzimuthOffset( dBestSatAzimuth ),
+		ulCandidatesEvaluated);
 
 	//if ( m_lpTraceSatFile )
 	{
@@ -1954,6 +2204,17 @@ CHGTCalibrationObj::GetDBFBestSatellite(CEMSRawSpCalibObj*  pRawSpCalibObj,
 			//_GetDBFSatellite(pRet, ulSat1, ulSat2, strSaSatData);
 
 			// RR - Feb.2, 2022 : If reference beacon FOA residual too large, do not use ths detection
+			//
+			// Amended: _GetDBFSatellite now returns EMS_FALSE only when the
+			// satellite is genuinely ambiguous, not merely when the FOA
+			// residual is large - an over-threshold residual is the signal
+			// that the stored bias needs correcting, so the detection is kept
+			// and allowed through to _CalculateOffsets, which clamps it.
+			// Dropping the object here still means "skipping
+			// CalibrateSpRawObject" in CHGTChannelCalibrationObj, which
+			// suppresses the LP record, the bias update and the SARR FCAL
+			// record all at once - so it must stay reserved for the case where
+			// we genuinely cannot attribute the detection to a satellite.
 			if( EMS_FALSE == hr )
 			{
 				pRet->Release();
